@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# ab-bg — run agent-browser (>=0.34.0) against the shared authenticated Chrome
+# (:9222) as a fully BACKGROUND agent, in the agent's OWN Chrome window.
+#
+# Stock agent-browser with --session + --pin-tab keeps concurrent agents from
+# hijacking each other's tabs, but it only ever works inside the human's
+# current window: `tab new` appends a tab to whatever window is in front and
+# foregrounds it (Target.createTarget without background:true — upstream PR
+# #1695 fixes the foregrounding, not the window choice). Two problems for the
+# human: their working window flickers, and it fills up with agent tabs.
+#
+# This wrapper gives each agent session its own window instead:
+#   Target.createTarget {newWindow:true, background:true}  -> new window, no
+#   focus steal (verified on Linux/X11), then Browser.setWindowBounds
+#   {windowState:"minimized"} so the agent's window never appears on screen or
+#   in the way. agent-browser is then bound to that target id, and every later
+#   command runs inside the agent's own hidden window.
+#
+# Reads, navigation, snapshot, screenshot, click and type all work against a
+# minimized window (verified) — Chrome keeps rendering it off-screen.
+#
+# Usage:
+#   ab-bg <session> spawn <url>            # create + pin a background tab in its OWN window
+#   ab-bg <session> <agent-browser args…>  # any other command, pinned
+#   ab-bg <session> cleanup                # close the agent's window + daemon
+#
+# Examples:
+#   ab-bg research-1 spawn https://news.ycombinator.com
+#   ab-bg research-1 snapshot
+#   ab-bg research-1 get text body
+#   ab-bg research-1 cleanup
+#
+# Notes:
+#   - Keep the same <session> on every call; the pin is sticky per session.
+#   - User labels do NOT survive a daemon restart; the CDP targetId (from
+#     `ab-bg <s> --json tab list`) is the only stable cross-restart ref.
+#   - `tab list` shows tabs from ALL windows, including the human's. Don't
+#     switch to one that isn't yours.
+#   - Don't route a deliberate `bringtofront` through ab-bg — it would undo it.
+#   - AB_BG_CDP_PORT overrides the CDP port (default 9222).
+#   - AB_BG_OWN_WINDOW=0 falls back to the old same-window `tab new` behavior.
+#   - AB_BG_SHOW_WINDOW=1 leaves the agent window visible (not minimized),
+#     for when you want to watch the agent work.
+set -uo pipefail
+
+PORT="${AB_BG_CDP_PORT:-9222}"
+OWN_WINDOW="${AB_BG_OWN_WINDOW:-1}"
+SHOW_WINDOW="${AB_BG_SHOW_WINDOW:-0}"
+SESSION="${1:?usage: ab-bg <session> <agent-browser args...>}"
+shift
+[[ $# -ge 1 ]] || { echo "usage: ab-bg <session> <agent-browser args...>" >&2; exit 2; }
+
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ab-bg"
+SPARES="$STATE_DIR/spares.$SESSION"
+mkdir -p "$STATE_DIR"
+
+export DISPLAY="${DISPLAY:-:1}"
+export XAUTHORITY="${XAUTHORITY:-/run/user/1000/gdm/Xauthority}"
+
+front() {
+  curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json" 2>/dev/null \
+    | jq -r '[.[] | select(.type=="page")][0].id // empty'
+}
+
+blanks() {  # target ids of about:blank pages (daemon connect-time spares live here)
+  curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json" 2>/dev/null \
+    | jq -r '.[] | select(.type=="page" and .url=="about:blank") | .id' | sort
+}
+
+xfocus() { xdotool getactivewindow 2>/dev/null; }
+
+ab() { agent-browser --cdp "$PORT" --session "$SESSION" "$@"; }
+
+# Create a tab in a brand-new, non-focus-stealing, minimized window.
+# Prints the target id, or nothing on failure.
+new_bg_window() {
+  local url="$1" minimize="$2"
+  AB_URL="$url" AB_MIN="$minimize" AB_PORT="$PORT" python3 - <<'PY' 2>/dev/null
+import json, os, sys, urllib.request
+try:
+    import websocket
+except ImportError:
+    sys.exit(1)
+port = os.environ["AB_PORT"]
+try:
+    u = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=5))["webSocketDebuggerUrl"]
+    ws = websocket.create_connection(u, timeout=10, suppress_origin=True)
+except Exception:
+    sys.exit(1)
+def call(i, m, p):
+    ws.send(json.dumps({"id": i, "method": m, "params": p}))
+    while True:
+        r = json.loads(ws.recv())
+        if r.get("id") == i:
+            if "error" in r: raise RuntimeError(r["error"])
+            return r["result"]
+try:
+    tid = call(1, "Target.createTarget",
+               {"url": os.environ["AB_URL"], "newWindow": True, "background": True})["targetId"]
+    if os.environ["AB_MIN"] == "1":
+        wid = call(2, "Browser.getWindowForTarget", {"targetId": tid})["windowId"]
+        call(3, "Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "minimized"}})
+    print(tid)
+except Exception:
+    sys.exit(1)
+finally:
+    ws.close()
+PY
+}
+
+SPAWNING=0
+case "$1" in
+  spawn)
+    URL="${2:?usage: ab-bg <session> spawn <url>}"
+    SPAWNING=1
+    PRE_BLANKS=$(blanks)
+    XBEFORE=$(xfocus)
+
+    TID=""
+    if [[ "$OWN_WINDOW" == 1 ]]; then
+      MIN=1; [[ "$SHOW_WINDOW" == 1 ]] && MIN=0
+      TID=$(new_bg_window "$URL" "$MIN")
+    fi
+
+    if [[ -n "$TID" ]]; then
+      # bind the session to the tab we just made in our own window
+      ab --pin-tab tab "$TID" >/dev/null 2>&1
+      STATUS=$?
+      # the daemon's connect-time about:blank spare may have appeared (and may
+      # have grabbed focus) — close it now rather than at cleanup
+      comm -13 <(printf '%s\n' "$PRE_BLANKS") <(blanks) 2>/dev/null | while read -r id; do
+        [[ -n "$id" ]] && curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json/close/$id" >/dev/null 2>&1
+      done
+      # hand the X focus back if anything took it
+      XAFTER=$(xfocus)
+      if [[ -n "$XBEFORE" && -n "$XAFTER" && "$XBEFORE" != "$XAFTER" ]]; then
+        xdotool windowactivate "$XBEFORE" >/dev/null 2>&1
+      fi
+      echo "$URL"
+      echo "targetId=$TID"
+      exit $STATUS
+    fi
+
+    # fallback: old same-window behavior
+    [[ "$OWN_WINDOW" == 1 ]] && echo "ab-bg: own-window spawn unavailable, falling back to same-window tab" >&2
+    set -- tab new --label "$SESSION" "$URL"
+    ;;
+  cleanup)
+    ab --pin-tab tab close >/dev/null 2>&1
+    ab close >/dev/null 2>&1
+    # close the daemon's connect-time about:blank spare(s) recorded at spawn,
+    # but only if they are still about:blank (never a tab someone navigated)
+    if [[ -f "$SPARES" ]]; then
+      LIVE_BLANKS=$(blanks)
+      while read -r id; do
+        [[ -n "$id" ]] && grep -qx "$id" <<<"$LIVE_BLANKS" \
+          && curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json/close/$id" >/dev/null 2>&1
+      done < "$SPARES"
+      rm -f "$SPARES"
+    fi
+    exit 0
+    ;;
+esac
+
+BEFORE=$(front)
+ab --pin-tab "$@"
+STATUS=$?
+
+if [[ "$SPAWNING" == 1 ]]; then
+  # about:blank targets that appeared during spawn = this daemon's spare(s)
+  comm -13 <(printf '%s\n' "$PRE_BLANKS") <(blanks) >> "$SPARES" 2>/dev/null
+fi
+
+AFTER=$(front)
+if [[ -n "$BEFORE" && -n "$AFTER" && "$AFTER" != "$BEFORE" ]]; then
+  # Foreground moved during the command. Only hand it back if the tab now in
+  # front is OUR bound tab (i.e. we stole it) — never fight a human who
+  # switched tabs themselves mid-command.
+  MINE=$(ab --pin-tab --json tab list 2>/dev/null \
+    | jq -r '.data.tabs[]? | select(.active) | .targetId // empty')
+  if [[ "$AFTER" == "$MINE" ]]; then
+    curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json/activate/$BEFORE" >/dev/null 2>&1
+  fi
+fi
+exit $STATUS
