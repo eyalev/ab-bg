@@ -111,13 +111,26 @@ this script, not in the model:
 3. An id that is not in the table **fails closed** (exit 4). `abstain`, or
    confidence under `--min` (default 0.8), prints the top three candidates and
    stops (exit 3). Nothing is clicked in either case.
-4. Otherwise one **trusted** `click @ref` — real CDP input, which is what OAuth
+4. **The same call asks a second, separate question about the intent as a
+   whole**: would carrying it out delete, pay, send, publish, change account
+   security, or otherwise be hard to undo? If that probability is at or above
+   `--danger` (default **0.3**, deliberately low — a wrong stop costs one
+   re-run, a wrong click cannot be taken back) the step stops with **exit 5**
+   whatever element won, and says what it would have clicked. `--force` records
+   that a person decided and proceeds. This is a separate yes/no rather than a
+   rule inside the element question because v1 tried that and hedged 0.65/0.35
+   on "delete the API key": the row menu *is* the correct next step, and that is
+   exactly the problem — the next step toward a destructive goal looks harmless.
+5. Otherwise one **trusted** `click @ref` — real CDP input, which is what OAuth
    popups and account choosers require — and a JSON result:
 
 ```json
-{"intent":"go to the Ask HN section","choice":"e106","confidence":0.97,
+{"intent":"go to the Ask HN section","choice":"e106","confidence":0.97,"destructive":0.01,
  "top3":[{"id":"e106","p":0.97,"what":"link: ask"},…],"ref":"e106","acted":true}
 ```
+
+Exit codes: `0` clicked · `3` abstained or under `--min` · `4` unknown id ·
+`5` destructive intent without `--force` · `2` no key · `1` provider failure.
 
 Text only: a canvas or image-only UI has no refs and gets `abstain`. `pick` only
 clicks; for a text field it focuses the field and you `fill @ref …` yourself.
