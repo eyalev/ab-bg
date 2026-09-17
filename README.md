@@ -85,6 +85,47 @@ One unique `<session>` per agent. Env knobs: `AB_BG_CDP_PORT` (default 9222),
 `AB_BG_SHOW_WINDOW=1` (own window, no focus steal, but visible — for watching
 the agent work), `AB_BG_OWN_WINDOW=0` (old same-window behaviour).
 
+## `pick` — a bounded-choice step, so the agent stops writing per-site regexes
+
+The step that kept costing agents turns was not clicking, it was *choosing*:
+which of five buttons is "Create key", which `li` is the right account in a
+Google chooser, which link is the cookie wall's "reject". Each got a one-off
+`innerText` regex. `pick` replaces that with one classifier call:
+
+```bash
+ab-bg s pick "open the API keys page"            # choose + trusted-click
+ab-bg s pick "reject the cookie banner" --dry    # choose only, print the top three
+ab-bg s pick "pick the eyalev@gmail.com account" --min 0.9
+```
+
+It is the shape of Cua's `jev-use` (trycua/cua #3916), and the safety lives in
+this script, not in the model:
+
+1. `snapshot -i` yields the interactive elements with `@refs`. **That is the
+   candidate table, and the script owns it** — only refs really on the page,
+   inputs and buttons first (so a cap of `--max 80` never drops the one button
+   under a hundred links), plus a mandatory `abstain`.
+2. TypeSafe's Jev — a model that answers typed questions with calibrated
+   probabilities instead of generating text — is asked one `Choice` over those
+   ids, with the intent and a 6 kB outline of the page as state. About 300 ms.
+3. An id that is not in the table **fails closed** (exit 4). `abstain`, or
+   confidence under `--min` (default 0.8), prints the top three candidates and
+   stops (exit 3). Nothing is clicked in either case.
+4. Otherwise one **trusted** `click @ref` — real CDP input, which is what OAuth
+   popups and account choosers require — and a JSON result:
+
+```json
+{"intent":"go to the Ask HN section","choice":"e106","confidence":0.97,
+ "top3":[{"id":"e106","p":0.97,"what":"link: ask"},…],"ref":"e106","acted":true}
+```
+
+Text only: a canvas or image-only UI has no refs and gets `abstain`. `pick` only
+clicks; for a text field it focuses the field and you `fill @ref …` yourself.
+Every run is appended to `~/.cache/ab-bg/pick.jsonl` with the question version
+(`pick-v1`), so a wrong pick can be read back and the wording improved rather
+than guessed at. The key is read from `~/.config/desk/typesafe.key`; without it
+`pick` exits 2 having asked and clicked nothing.
+
 ## Porting notes
 
 - **The CDP part is universal.** Any CDP client can do it: Playwright's

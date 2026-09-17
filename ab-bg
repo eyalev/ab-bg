@@ -23,6 +23,25 @@
 #   ab-bg <session> spawn <url>            # create + pin a background tab in its OWN window
 #   ab-bg <session> <agent-browser args…>  # any other command, pinned
 #   ab-bg <session> cleanup                # close the agent's window + daemon
+#   ab-bg <session> pick "<intent>" [--dry] [--min 0.8] [--max 80]
+#                                          # let a calibrated classifier choose WHICH
+#                                          # interactive element matches the intent,
+#                                          # then trusted-click it (see "pick" below)
+#
+# pick — a bounded-choice step (the shape of Cua's jev-use, 2026-09-17):
+#   1. `snapshot -i` gives the interactive elements with @refs — that is the
+#      candidate table, and THIS SCRIPT owns it: only refs that are actually on
+#      the page, plus a mandatory `abstain`, are ever offered.
+#   2. TypeSafe's Jev (a System One model: no text generation, one Choice with
+#      calibrated probabilities, ~300 ms) picks one candidate id for the intent.
+#   3. An id not in the table fails closed (exit 4). `abstain`, or confidence
+#      below --min, prints the top three and stops (exit 3) — nothing is clicked.
+#   4. Otherwise one trusted `click @ref` (real CDP input, so OAuth popups and
+#      account choosers work), and the result is printed as JSON.
+#   Text-only: canvas or image-only UIs have no refs and get `abstain`. Every
+#   run is appended to ~/.cache/ab-bg/pick.jsonl with the question version, so
+#   a bad pick can be read back. Key: ~/.config/desk/typesafe.key. Notes and
+#   the cross-project journal: ~/.claude/docs/typesafe-jev.md.
 #
 # Examples:
 #   ab-bg research-1 spawn https://news.ycombinator.com
@@ -144,6 +163,110 @@ case "$1" in
     # fallback: old same-window behavior
     [[ "$OWN_WINDOW" == 1 ]] && echo "ab-bg: own-window spawn unavailable, falling back to same-window tab" >&2
     set -- tab new --label "$SESSION" "$URL"
+    ;;
+  pick)
+    INTENT="${2:?usage: ab-bg <session> pick \"<intent>\" [--dry] [--min 0.8] [--max 80]}"
+    shift 2
+    DRY=0; MIN=0.8; MAX=80
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --dry) DRY=1; shift ;;
+        --min) MIN="${2:?--min needs a number}"; shift 2 ;;
+        --max) MAX="${2:?--max needs a number}"; shift 2 ;;
+        *) echo "ab-bg pick: unknown option $1" >&2; exit 2 ;;
+      esac
+    done
+    KEY_FILE="$HOME/.config/desk/typesafe.key"
+    [[ -r "$KEY_FILE" ]] || { echo "ab-bg pick: no key at $KEY_FILE — nothing was asked, nothing clicked" >&2; exit 2; }
+    SNAP=$(ab --pin-tab --json snapshot -i 2>/dev/null) || { echo "ab-bg pick: snapshot failed" >&2; exit 1; }
+    # The classifier step. Prints one JSON line; exit 0 = a candidate was chosen
+    # with enough confidence, 3 = abstained / below --min, 4 = unknown id (fail
+    # closed), 1 = provider or parse failure. The ref to click is on stdout only
+    # when exit is 0 -- the shell below never clicks anything else.
+    RESULT=$(AB_INTENT="$INTENT" AB_MIN="$MIN" AB_MAX="$MAX" AB_KEY_FILE="$KEY_FILE" AB_DRY="$DRY" \
+      AB_LOG="$STATE_DIR/pick.jsonl" AB_SESSION="$SESSION" python3 - "$SNAP" <<'PY'
+import json, os, sys, time, urllib.request
+QUESTION_VERSION = "pick-v1"
+ACT = {"link","button","textbox","searchbox","checkbox","radio","combobox","menuitem",
+       "menuitemcheckbox","menuitemradio","tab","switch","option","slider","spinbutton"}
+snap = json.loads(sys.argv[1]).get("data", {})
+refs = snap.get("refs", {}) or {}
+intent, minc, maxn = os.environ["AB_INTENT"], float(os.environ["AB_MIN"]), int(os.environ["AB_MAX"])
+
+def natural(k):  # e1, e2, ... e10 in DOM order, not lexicographic
+    try: return int(k.lstrip("e"))
+    except ValueError: return 10**9
+cands = []
+for k in sorted(refs, key=natural):
+    r = refs[k]; role = r.get("role", ""); name = (r.get("name") or "").strip()
+    if role not in ACT: continue
+    if not name and role not in ("textbox", "searchbox", "combobox"): continue
+    cands.append((k, role, name[:120] or "(unnamed input)"))
+# Inputs and buttons first: the cap must not drop the one button under 79 links.
+cands.sort(key=lambda c: (0 if c[1] != "link" else 1))
+cands = cands[:maxn]
+table = {k: f"{role}: {name}" for k, role, name in cands}
+table["abstain"] = ("None of these clearly carries out the intent, or acting would be destructive, "
+                    "irreversible or need a person's confirmation first.")
+if len(table) == 1:
+    out = {"intent": intent, "choice": "abstain", "confidence": 1.0, "reason": "no interactive elements", "acted": False}
+    print(json.dumps(out)); sys.exit(3)
+
+key = open(os.environ["AB_KEY_FILE"]).read().strip()
+tree = (snap.get("snapshot") or "")
+state = {"intent": intent, "page": snap.get("origin", ""),
+         "interactive_elements": [f"{k} = {table[k]}" for k in table if k != "abstain"],
+         "page_outline": tree[:6000]}
+body = {"state": state, "model": "jev-latest", "questions": {"pick": {
+    "type": "choice",
+    "instructions": ("Which ONE element should be acted on (clicked) to carry out the intent, "
+                     "as the very next step? Prefer the element whose visible role and name match "
+                     "the intent most directly. Choose abstain when nothing matches clearly, when "
+                     "several match equally, or when the action would delete, pay, send, or otherwise "
+                     "be hard to undo."),
+    "criteria": table}}}
+t0 = time.time()
+try:
+    req = urllib.request.Request("https://api.typesafe.ai/v1/systemone", data=json.dumps(body).encode(),
+                                 headers={"content-type": "application/json", "authorization": f"Bearer {key}"})
+    ans = json.load(urllib.request.urlopen(req, timeout=30))["answers"]["pick"]
+except Exception as e:
+    print(json.dumps({"intent": intent, "error": str(e)[:200], "acted": False})); sys.exit(1)
+ms = int((time.time() - t0) * 1000)
+choice, conf, probs = ans.get("choice"), float(ans.get("confidence", 0)), ans.get("probabilities", {}) or {}
+top = sorted(probs.items(), key=lambda kv: -kv[1])[:3]
+out = {"intent": intent, "choice": choice, "confidence": round(conf, 3),
+       "top3": [{"id": k, "p": round(p, 3), "what": table.get(k, "?")} for k, p in top],
+       "candidates": len(table) - 1, "ms": ms, "question": QUESTION_VERSION, "acted": False}
+if choice not in table:                       # fail closed
+    out["error"] = "provider returned an id not in the candidate table"; code = 4
+elif choice == "abstain" or conf < minc:
+    out["stopped"] = "abstain" if choice == "abstain" else f"confidence {conf:.2f} < {minc}"; code = 3
+else:
+    out["ref"], out["what"] = choice, table[choice]; code = 0
+try:
+    os.makedirs(os.path.dirname(os.environ["AB_LOG"]), exist_ok=True)
+    with open(os.environ["AB_LOG"], "a") as f:
+        f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "session": os.environ["AB_SESSION"],
+                            "page": state["page"], **out, "dry": os.environ.get("AB_DRY") == "1"}) + "\n")
+except Exception:
+    pass
+print(json.dumps(out)); sys.exit(code)
+PY
+    )
+    PSTATUS=$?
+    if [[ $PSTATUS -ne 0 || "$DRY" == 1 ]]; then
+      echo "$RESULT"
+      exit $PSTATUS
+    fi
+    REF=$(jq -r '.ref // empty' <<<"$RESULT")
+    [[ -n "$REF" ]] || { echo "$RESULT"; exit 4; }
+    if ab --pin-tab click "@$REF" >/dev/null 2>&1; then
+      jq -c '.acted = true' <<<"$RESULT"
+      exit 0
+    fi
+    jq -c '.acted = false | .error = "click failed"' <<<"$RESULT"
+    exit 1
     ;;
   cleanup)
     ab --pin-tab tab close >/dev/null 2>&1
