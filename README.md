@@ -132,6 +132,24 @@ this script, not in the model:
 Exit codes: `0` clicked · `3` abstained or under `--min` · `4` unknown id ·
 `5` destructive intent without `--force` · `2` no key · `1` provider failure.
 
+### The same gate in front of a full loop
+
+`pick` is one step. [browser-use/jev-ultrafast](https://github.com/browser-use/jev-ultrafast)
+is the whole loop with the same skeleton — DOM element table, Jev picks operation
+and target in one request, the app executes from its own node — but no question
+about whether the *goal* should be confirmed by a person first.
+`examples/jev-ultrafast-gated.py` runs their `Agent` unmodified with this gate
+in front of it: the goal is judged once before anything is chosen, every step
+is judged before it is executed, and either at or above `--danger` stops the run
+with exit 5. `BU_CDP_URL=http://127.0.0.1:9222` points Browser Harness at the
+shared signed-in Chrome, where the agent uses its own background tab.
+
+First runs: the Google account chooser, one click, done in 5.3 s (goal 0.07,
+step 0.05). "Create a new API key" stopped at step 0 (goal 0.60); with `--force`
+the loop clicked *Create key*, had a small LLM type the name, clicked the
+dialog's *Create key* — step gate 0.43, the one irreversible click in the run —
+and finished in 8.4 s.
+
 Text only: a canvas or image-only UI has no refs and gets `abstain`. `pick` only
 clicks; for a text field it focuses the field and you `fill @ref …` yourself.
 Every run is appended to `~/.cache/ab-bg/pick.jsonl` with the question version
