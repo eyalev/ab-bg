@@ -132,17 +132,35 @@ this script, not in the model:
 Exit codes: `0` clicked · `3` abstained or under `--min` · `4` unknown id ·
 `5` destructive intent without `--force` · `2` no key · `1` provider failure.
 
-### The same gate in front of a full loop
+### `run` — the same gate in front of a full loop
 
 `pick` is one step. [browser-use/jev-ultrafast](https://github.com/browser-use/jev-ultrafast)
 is the whole loop with the same skeleton — DOM element table, Jev picks operation
-and target in one request, the app executes from its own node — but no question
-about whether the *goal* should be confirmed by a person first.
-`examples/jev-ultrafast-gated.py` runs their `Agent` unmodified with this gate
-in front of it: the goal is judged once before anything is chosen, every step
-is judged before it is executed, and either at or above `--danger` stops the run
-with exit 5. `BU_CDP_URL=http://127.0.0.1:9222` points Browser Harness at the
-shared signed-in Chrome, where the agent uses its own background tab.
+and target in one request, a small LLM types when a field needs text, the app
+executes from its own node — but no question about whether the *goal* should be
+confirmed by a person first.
+
+```bash
+ab-bg s spawn 'https://accounts.google.com/AccountChooser?continue=https://myaccount.google.com/'
+ab-bg s run "Choose the eyalev@gmail.com account to continue."      # done in ~4 s
+ab-bg s run "Create a new API key named test." --dry                 # exit 5: goal 0.60 destructive
+ab-bg s run "Create a new API key named test." --force               # a person decided; 3 actions, ~8 s
+```
+
+`run` drives **this session's own hidden tab** (their `Agent`, unmodified, on a
+borrowed target) with the gate from `pick` in front of it: the goal is judged
+once before anything is chosen, every step is judged before it executes, and
+either at or above `--danger` (0.3) stops the run with exit 5 and says what it
+would have done. `--dry` judges the goal and predicts the first step only.
+Exit `0` done · `3` blocked or gave up · `5` gated. Each step is a JSON line and
+lands in `~/.cache/ab-bg/ultrafast.jsonl`.
+
+It needs the jev-ultrafast checkout (`AB_BG_ULTRAFAST_DIR`, default
+`~/projects/github/browser-use/jev-ultrafast`, `uv sync` once) — the driver is
+`examples/jev-ultrafast-gated.py` here, run inside their venv with
+`BU_CDP_URL` pointing Browser Harness at the same Chrome. Text is written by
+xAI's grok-4.5 unless `TEXT_MODEL_API_KEY` / `TEXT_MODEL_BASE_URL` /
+`TEXT_MODEL` say otherwise.
 
 First runs: the Google account chooser, one click, done in 5.3 s (goal 0.07,
 step 0.05). "Create a new API key" stopped at step 0 (goal 0.60); with `--force`

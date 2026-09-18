@@ -36,8 +36,47 @@ from pathlib import Path
 
 import httpx
 from jev_ultrafast import Agent
+from jev_ultrafast import agent as _agent_mod
+from jev_ultrafast.browser import Browser
 
 GATE_VERSION = "ultrafast-gate-v1"
+
+
+class BorrowedBrowser(Browser):
+    """Their Browser on a tab that already exists -- the ab-bg session's own hidden tab.
+
+    Same session setup as the original (device metrics, focus emulation) but no new
+    target, no navigation unless a URL is given, and close() detaches instead of
+    closing: the tab belongs to the ab-bg session, which cleans it up itself.
+    """
+
+    def __init__(self, target, url=None):
+        from browser_harness.admin import ensure_daemon
+        from browser_harness.helpers import cdp
+        ensure_daemon()
+        self.target = target
+        self.session = cdp("Target.attachToTarget", targetId=target, flatten=True)["sessionId"]
+        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        if url:
+            self.call("Page.navigate", url=url)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                if self.evaluate("document.readyState") == "complete":
+                    break
+            except Exception:
+                pass
+            time.sleep(0.02)
+
+    def close(self):
+        from browser_harness.helpers import cdp
+        if self.target:
+            try:
+                cdp("Target.detachFromTarget", sessionId=self.session)
+            except Exception:
+                pass
+            self.target = None
 LOG = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ab-bg" / "ultrafast.jsonl"
 
 GOAL_Q = ("Carrying out the GOAL as a whole would delete, remove, revoke, cancel, pay, purchase, "
@@ -78,16 +117,24 @@ def log(row):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", required=True)
+    ap.add_argument("--url", help="page to open; with --target, optional (stay on the tab's current page)")
+    ap.add_argument("--target", help="existing CDP target id to drive (an ab-bg session's tab) instead of opening a new tab")
     ap.add_argument("--goal", required=True)
     ap.add_argument("--danger", type=float, default=0.3)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--dry", action="store_true", help="judge the goal and predict the first step; execute nothing")
     ap.add_argument("--max-steps", type=int, default=12)
     args = ap.parse_args()
+    if not args.url and not args.target:
+        sys.exit("--url or --target is required")
     key = os.environ.get("TYPESAFE_API_KEY") or sys.exit("TYPESAFE_API_KEY missing; nothing run")
 
+    if args.target:
+        # Their Agent builds Browser(url) itself; hand it ours for this one construction.
+        _agent_mod.Browser = lambda url: BorrowedBrowser(args.target, url or None)
+
     started = time.perf_counter()
-    with Agent(args.url, args.goal) as agent:
+    with Agent(args.url or "", args.goal) as agent:
         st = agent.state
 
         retries = 0
@@ -125,6 +172,11 @@ def main():
             d = st["decision"]
             choice = d["choice"]
             page = st["page"]
+            if args.dry:
+                label = next((a.get("label", choice) for a in page["actions"] if a["id"] == choice), choice)
+                row = {"step": 1, "dry": True, "would_have": f"{d.get('operation')} {label}", "p": round(d["probabilities"].get(choice, 0), 3),
+                       "confidence": round(d["confidence"], 3), "goal_destructive": round(goal_p, 3), "acted": False}
+                log(row); print(json.dumps(row)); sys.exit(0)
             if choice in {"DONE", "BLOCKED"}:
                 try:
                     out = agent.command("act", {"fingerprint": page["fingerprint"]})

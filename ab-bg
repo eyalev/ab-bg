@@ -27,6 +27,10 @@
 #                                          # let a calibrated classifier choose WHICH
 #                                          # interactive element matches the intent,
 #                                          # then trusted-click it (see "pick" below)
+#   ab-bg <session> run "<goal>" [--url U] [--dry] [--danger 0.3] [--force] [--max-steps 12]
+#                                          # a whole task on this session's tab: the
+#                                          # jev-ultrafast loop with pick's gate before
+#                                          # every step (see "run" in the case below)
 #
 # pick — a bounded-choice step (the shape of Cua's jev-use, 2026-09-17):
 #   1. `snapshot -i` gives the interactive elements with @refs — that is the
@@ -299,6 +303,38 @@ PY
     fi
     jq -c '.acted = false | .error = "click failed"' <<<"$RESULT"
     exit 1
+    ;;
+  run)
+    # A whole task, not one click: browser-use/jev-ultrafast's loop (look → Jev picks
+    # operation + element → act → repeat, a small LLM typing when a field needs text)
+    # on THIS session's hidden tab, with pick's destructive gate in front of every
+    # step (examples/jev-ultrafast-gated.py in the ab-bg repo). The goal is judged
+    # once before anything is chosen and every step before it runs; at or above
+    # --danger (0.3) the run stops with exit 5 and says what it would have done;
+    # --force records that a person decided. --dry judges the goal and predicts the
+    # first step only. Exit 0 = done, 3 = blocked / gave up, 5 = gated.
+    #
+    # Needs the jev-ultrafast checkout (AB_BG_ULTRAFAST_DIR, default
+    # ~/projects/github/browser-use/jev-ultrafast, `uv sync` once) and
+    # ~/.config/desk/typesafe.key; text is written by xAI's grok-4.5 unless
+    # TEXT_MODEL_API_KEY / TEXT_MODEL_BASE_URL / TEXT_MODEL are set.
+    GOAL="${2:?usage: ab-bg <session> run \"<goal>\" [--url <url>] [--dry] [--danger 0.3] [--force] [--max-steps 12]}"
+    shift 2
+    UF="${AB_BG_ULTRAFAST_DIR:-$HOME/projects/github/browser-use/jev-ultrafast}"
+    GATED="$HOME/projects/personal/2026-09/ab-bg/examples/jev-ultrafast-gated.py"
+    [[ -f "$UF/pyproject.toml" ]] || { echo "ab-bg run: no jev-ultrafast checkout at $UF — git clone https://github.com/browser-use/jev-ultrafast.git \"$UF\" && (cd \"$UF\" && uv sync)" >&2; exit 2; }
+    [[ -f "$GATED" ]] || { echo "ab-bg run: missing $GATED" >&2; exit 2; }
+    [[ -r "$HOME/.config/desk/typesafe.key" ]] || { echo "ab-bg run: no key at ~/.config/desk/typesafe.key" >&2; exit 2; }
+    TID=$(ab --pin-tab --json tab list 2>/dev/null | jq -r '.data.tabs[]? | select(.active) | .targetId // empty' | head -1)
+    [[ -n "$TID" ]] || { echo "ab-bg run: this session has no tab — spawn one first" >&2; exit 2; }
+    export BU_CDP_URL="http://127.0.0.1:$PORT"
+    export TYPESAFE_API_KEY; TYPESAFE_API_KEY=$(cat "$HOME/.config/desk/typesafe.key")
+    if [[ -z "${TEXT_MODEL_API_KEY:-}" && -r "$HOME/.config/desk/xai.key" ]]; then
+      export TEXT_MODEL_API_KEY; TEXT_MODEL_API_KEY=$(cat "$HOME/.config/desk/xai.key")
+      export TEXT_MODEL_BASE_URL="${TEXT_MODEL_BASE_URL:-https://api.x.ai/v1}" TEXT_MODEL="${TEXT_MODEL:-grok-4.5}" TEXT_MODEL_REASONING="${TEXT_MODEL_REASONING:-none}"
+    fi
+    (cd "$UF" && exec uv run --quiet python "$GATED" --target "$TID" --goal "$GOAL" "$@")
+    exit $?
     ;;
   cleanup)
     ab --pin-tab tab close >/dev/null 2>&1
