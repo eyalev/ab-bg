@@ -69,6 +69,45 @@ class BorrowedBrowser(Browser):
                 pass
             time.sleep(0.02)
 
+    # ---- popups -----------------------------------------------------------
+    # An OAuth "Continue with Google" opens a SEPARATE browser target. Neither
+    # their Browser nor ab-bg's pin follows it, so the loop would keep looking at
+    # the parent page saying "signing in…" while the account chooser sits in a
+    # window nobody is driving. sync_target() checks after every action: a new
+    # page target whose opener is the tab we drive becomes the tab we drive; when
+    # it closes, we go back to the parent. Same trusted CDP input, same gate,
+    # different target id — no xdotool, no screenshots, no focus change.
+
+    def _attach(self, target):
+        from browser_harness.helpers import cdp
+        try:
+            cdp("Target.detachFromTarget", sessionId=self.session)
+        except Exception:
+            pass
+        self.target = target
+        self.session = cdp("Target.attachToTarget", targetId=target, flatten=True)["sessionId"]
+        try:
+            self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        except Exception:
+            pass
+
+    def sync_target(self):
+        """Follow a popup opened from the driven tab, or return from a closed one. Returns a note or None."""
+        from browser_harness.helpers import cdp
+        infos = cdp("Target.getTargets")["targetInfos"]
+        ids = {t["targetId"] for t in infos}
+        home = getattr(self, "home", None) or self.target
+        self.home = home
+        if self.target != home and self.target not in ids:
+            self._attach(home)
+            return f"popup closed; back to {home[:8]}"
+        if self.target == home:
+            popup = next((t for t in infos if t["type"] == "page" and t.get("openerId") == home and t["targetId"] in ids), None)
+            if popup:
+                self._attach(popup["targetId"])
+                return f"following popup {popup['targetId'][:8]} {popup['url'][:60]}"
+        return None
+
     def close(self):
         from browser_harness.helpers import cdp
         if self.target:
@@ -138,6 +177,38 @@ def main():
         st = agent.state
 
         retries = 0
+        unsure_verdicts = 0
+
+        def settle(seconds=8.0):
+            # The parent of a just-closed OAuth popup is busy finishing the sign-in: it
+            # redirects a moment later. Judging it at once reads "still the login page"
+            # and the loop says BLOCKED. Wait for the URL or the DOM to move, bounded.
+            b = st["browser"]
+            try:
+                before = b.evaluate("location.href + '|' + document.body.innerText.length")
+            except Exception:
+                before = None
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                time.sleep(0.25)
+                try:
+                    now = b.evaluate("location.href + '|' + document.body.innerText.length")
+                    if now != before and b.evaluate("document.readyState") == "complete":
+                        time.sleep(0.5); return True
+                except Exception:
+                    pass
+            return False
+
+        def follow():
+            # Popups: switch to one that opened from our tab, or back when it closed.
+            b = st["browser"]
+            note = b.sync_target() if hasattr(b, "sync_target") else None
+            if note:
+                log({"popup": note}); print(json.dumps({"popup": note}))
+                if note.startswith("popup closed"):
+                    moved = settle()
+                    log({"settled": moved}); print(json.dumps({"settled": moved}))
+            return note
 
         def reobserve():
             # After a click that navigates, the document is "navigating" for a few hundred
@@ -145,6 +216,7 @@ def main():
             st["decision"] = None; st["status"] = "ready"
             for _ in range(30):
                 try:
+                    follow()
                     st["page"] = st["browser"].observe(screenshot=False); return
                 except Exception:
                     time.sleep(0.1)
@@ -177,6 +249,13 @@ def main():
                 row = {"step": 1, "dry": True, "would_have": f"{d.get('operation')} {label}", "p": round(d["probabilities"].get(choice, 0), 3),
                        "confidence": round(d["confidence"], 3), "goal_destructive": round(goal_p, 3), "acted": False}
                 log(row); print(json.dumps(row)); sys.exit(0)
+            if choice in {"DONE", "BLOCKED"} and d["confidence"] < 0.5 and unsure_verdicts < 2:
+                # A hesitant verdict right after a navigation is usually a page that has not
+                # finished changing. Look again, twice at most, before accepting it.
+                unsure_verdicts += 1
+                row = {"step": step, "choice": choice, "confidence": round(d["confidence"], 3), "unsure": "re-observing"}
+                log(row); print(json.dumps(row))
+                time.sleep(1.5); reobserve(); continue
             if choice in {"DONE", "BLOCKED"}:
                 try:
                     out = agent.command("act", {"fingerprint": page["fingerprint"]})
@@ -204,12 +283,20 @@ def main():
                 out = agent.command("act", {"fingerprint": page["fingerprint"]})
             except Exception as e:  # StalePage or a guard inside the agent: observe again, do not count it
                 row.update(acted=False, retry=str(e)[:120]); log(row); print(json.dumps(row))
-                retries += 1
-                if retries >= 3:   # the same failure three times is a wall, not a hiccup
-                    give_up(f"three consecutive failures; last: {str(e)[:120]}")
+                # A popup that just closed under us (consent's Continue) throws here too; that is
+                # progress, not a failure, so it does not count toward the three strikes.
+                if not follow():
+                    retries += 1
+                    if retries >= 3:   # the same failure three times is a wall, not a hiccup
+                        give_up(f"three consecutive failures; last: {str(e)[:120]}")
                 reobserve()
                 continue
             retries = 0
+            # Did that click open a popup (OAuth)? Then the next observation must be of the popup.
+            time.sleep(0.4)
+            if follow():
+                reobserve()
+                out = {**out, "status": st["status"]}
             row.update(acted=True, page_changed=st["history"][-1]["page_changed"], status=out["status"],
                        elapsed_ms=out["elapsed_ms"], url_after=st["page"].get("url"))
             log(row); print(json.dumps(row))

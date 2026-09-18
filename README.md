@@ -155,6 +155,19 @@ would have done. `--dry` judges the goal and predicts the first step only.
 Exit `0` done · `3` blocked or gave up · `5` gated. Each step is a JSON line and
 lands in `~/.cache/ab-bg/ultrafast.jsonl`.
 
+**OAuth popups are followed.** "Continue with Google" opens a separate browser
+target that neither their driver nor `ab-bg`'s pin would otherwise see. After
+every action the driver checks for a new page whose opener is the tab it drives
+and switches to it; when the popup closes it switches back and waits (bounded)
+for the parent to finish its redirect. Same trusted CDP input, same gate, no
+window focus, no screenshots:
+
+```bash
+ab-bg s spawn https://platform.claude.com/login
+ab-bg s run "Sign in with Google using the eyalev@gmail.com account. Stop when the console is signed in."
+# Continue with Google → popup: account row → consent Continue → popup closes → /dashboard. 10 s.
+```
+
 It needs the jev-ultrafast checkout (`AB_BG_ULTRAFAST_DIR`, default
 `~/projects/github/browser-use/jev-ultrafast`, `uv sync` once) — the driver is
 `examples/jev-ultrafast-gated.py` here, run inside their venv with
