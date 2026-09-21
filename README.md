@@ -66,9 +66,11 @@ residue:
 | Concern | What the script does |
 |---|---|
 | Sticky binding | `--session <name> --pin-tab tab <targetId>` right after creating the window; the same `<session>` on every call keeps the pin. |
-| The daemon's stray `about:blank` | agent-browser's daemon opens a spare `about:blank` when it first connects, which can grab focus. The script diffs `/json` before/after spawn and closes only blanks that appeared, and only if still blank at cleanup (never a tab someone navigated). |
+| The daemon's stray `about:blank` | agent-browser's daemon opens a spare `about:blank` when it first connects. It is born in whatever window Chrome has in front — *the human's* — where it appends itself to the end of the tab strip and takes the selection. The script diffs `/json` around every command (not just spawn) and closes only blanks that appeared, polling for a beat because the spare can arrive after the command returns, and only if still blank at cleanup (never a tab someone navigated). |
+| Tab restore | Closing the spare drops Chrome onto the tab beside it, so the human is left on their *last* tab rather than the one they were reading. The script records the front tab before the command and re-activates it after — the X-focus restore below cannot fix this, because the wrong tab is inside the right window. |
 | Focus restore | Records the active X window before spawn (`xdotool getactivewindow`), re-activates it if anything took focus. Belt-and-braces — `background:true` alone usually suffices. |
-| Don't fight the human | After any command, if the front tab changed *and the new front tab is ours*, hand it back. If the human switched tabs themselves mid-command, leave it. |
+| Keeping the window down | Chrome ignores a minimize aimed at a window that new, and the `tab <targetId>` bind raises and maximizes it anyway, so the minimize is re-applied after the bind. |
+| Don't fight the human | After any command, if the front tab changed *and* either the new front tab is ours or we closed a spare, hand it back. If the human switched tabs themselves mid-command, leave it. |
 | Cleanup | `ab-bg <s> cleanup` closes the pinned tab, the daemon, and the recorded spares. |
 | Fallback | If own-window spawn fails (no `websocket-client`, CDP down), fall back to a labelled same-window tab and say so on stderr. |
 

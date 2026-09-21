@@ -98,6 +98,45 @@ blanks() {  # target ids of about:blank pages (daemon connect-time spares live h
     | jq -r '.[] | select(.type=="page" and .url=="about:blank") | .id' | sort
 }
 
+# Close about:blank targets that appeared since $1 (a sorted id list), recording
+# them as this session's spares. The daemon can open its spare a beat after the
+# command that started it returns, so poll for $2 seconds instead of looking
+# exactly once. Returns 0 if anything was closed.
+reap_spares() {
+  local pre="$1" tries=$(( ${2:-3} * 4 )) id new closed=1
+  while :; do
+    new=$(comm -13 <(printf '%s\n' "$pre") <(blanks) 2>/dev/null)
+    if [[ -n "$new" ]]; then
+      printf '%s\n' "$new" >> "$SPARES"
+      while read -r id; do
+        [[ -n "$id" ]] || continue
+        curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json/close/$id" >/dev/null 2>&1
+        closed=0
+      done <<< "$new"
+    fi
+    (( tries-- > 0 )) || break
+    sleep 0.25
+  done
+  return $closed
+}
+
+# Re-select the tab that was in front before we touched the browser. The X-focus
+# restore is not enough on its own: the spare is born in the user's front window,
+# so closing it drops Chrome onto the tab beside it and the user is left on their
+# last tab rather than the one they were reading. $2, when given, is our own tab —
+# never hand the selection to that.
+restore_front() {
+  local want="$1" mine="${2:-}" now
+  [[ -n "$want" ]] || return 0
+  now=$(front)
+  [[ -n "$now" && "$now" != "$want" ]] || return 0
+  [[ -z "$mine" || "$now" != "$mine" ]] || return 0
+  # only if the tab is still there to go back to
+  curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json" 2>/dev/null \
+    | jq -e --arg id "$want" 'any(.[]; .id == $id)' >/dev/null 2>&1 || return 0
+  curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json/activate/$want" >/dev/null 2>&1
+}
+
 xfocus() { xdotool getactivewindow 2>/dev/null; }
 
 ab() { agent-browser --cdp "$PORT" --session "$SESSION" "$@"; }
@@ -139,6 +178,40 @@ finally:
 PY
 }
 
+# Put the window holding $1 back down. Chrome ignores a minimize aimed at a
+# window this young (setWindowBounds returns, the state reads back "normal"),
+# and binding the session to the tab raises and maximizes it regardless -- so the
+# minimize has to be re-applied after the bind, not only at creation.
+minimize_target() {
+  AB_TID="$1" AB_PORT="$PORT" python3 - <<'PY' 2>/dev/null
+import json, os, sys, urllib.request
+try:
+    import websocket
+except ImportError:
+    sys.exit(1)
+port = os.environ["AB_PORT"]
+try:
+    u = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=5))["webSocketDebuggerUrl"]
+    ws = websocket.create_connection(u, timeout=10, suppress_origin=True)
+except Exception:
+    sys.exit(1)
+def call(i, m, p):
+    ws.send(json.dumps({"id": i, "method": m, "params": p}))
+    while True:
+        r = json.loads(ws.recv())
+        if r.get("id") == i:
+            if "error" in r: raise RuntimeError(r["error"])
+            return r["result"]
+try:
+    wid = call(1, "Browser.getWindowForTarget", {"targetId": os.environ["AB_TID"]})["windowId"]
+    call(2, "Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "minimized"}})
+except Exception:
+    sys.exit(1)
+finally:
+    ws.close()
+PY
+}
+
 SPAWNING=0
 case "$1" in
   spawn)
@@ -146,6 +219,7 @@ case "$1" in
     SPAWNING=1
     PRE_BLANKS=$(blanks)
     XBEFORE=$(xfocus)
+    FBEFORE=$(front)
 
     TID=""
     if [[ "$OWN_WINDOW" == 1 ]]; then
@@ -157,11 +231,15 @@ case "$1" in
       # bind the session to the tab we just made in our own window
       ab --pin-tab tab "$TID" >/dev/null 2>&1
       STATUS=$?
-      # the daemon's connect-time about:blank spare may have appeared (and may
-      # have grabbed focus) — close it now rather than at cleanup
-      comm -13 <(printf '%s\n' "$PRE_BLANKS") <(blanks) 2>/dev/null | while read -r id; do
-        [[ -n "$id" ]] && curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json/close/$id" >/dev/null 2>&1
-      done
+      # the bind just raised and maximized our window -- put it back down
+      [[ "$MIN" == 1 ]] && minimize_target "$TID"
+      # The daemon's connect-time about:blank spare is born in whatever window
+      # Chrome has in front — the user's — where it appends itself to the end of
+      # the strip and takes the selection. Close it now rather than at cleanup.
+      reap_spares "$PRE_BLANKS" 3
+      # Closing it leaves Chrome on the neighbouring tab, so give the user back
+      # the tab they were on before touching X focus.
+      restore_front "$FBEFORE" "$TID"
       # hand the X focus back if anything took it
       XAFTER=$(xfocus)
       if [[ -n "$XBEFORE" && -n "$XAFTER" && "$XBEFORE" != "$XAFTER" ]]; then
@@ -353,24 +431,28 @@ PY
     ;;
 esac
 
+# Any command can be the one that (re)starts the daemon, and the spare it opens
+# lands in the user's window whether or not we are spawning — so always know
+# which blanks predate us.
+PRE_BLANKS="${PRE_BLANKS-$(blanks)}"
 BEFORE=$(front)
 ab --pin-tab "$@"
 STATUS=$?
 
-if [[ "$SPAWNING" == 1 ]]; then
-  # about:blank targets that appeared during spawn = this daemon's spare(s)
-  comm -13 <(printf '%s\n' "$PRE_BLANKS") <(blanks) >> "$SPARES" 2>/dev/null
-fi
+# about:blank targets that appeared = this daemon's spare(s)
+REAPED=0
+reap_spares "$PRE_BLANKS" 1 && REAPED=1
 
 AFTER=$(front)
 if [[ -n "$BEFORE" && -n "$AFTER" && "$AFTER" != "$BEFORE" ]]; then
-  # Foreground moved during the command. Only hand it back if the tab now in
-  # front is OUR bound tab (i.e. we stole it) — never fight a human who
-  # switched tabs themselves mid-command.
+  # Foreground moved during the command. Hand it back only if we are the ones
+  # who moved it — either our bound tab is in front, or a spare of ours took
+  # the selection and displaced it on close. Never fight a human who switched
+  # tabs themselves mid-command.
   MINE=$(ab --pin-tab --json tab list 2>/dev/null \
     | jq -r '.data.tabs[]? | select(.active) | .targetId // empty')
-  if [[ "$AFTER" == "$MINE" ]]; then
-    curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json/activate/$BEFORE" >/dev/null 2>&1
+  if [[ "$AFTER" == "$MINE" || "$REAPED" == 1 ]]; then
+    restore_front "$BEFORE" "$MINE"
   fi
 fi
 exit $STATUS
