@@ -123,14 +123,12 @@ reap_spares() {
 # Re-select the tab that was in front before we touched the browser. The X-focus
 # restore is not enough on its own: the spare is born in the user's front window,
 # so closing it drops Chrome onto the tab beside it and the user is left on their
-# last tab rather than the one they were reading. $2, when given, is our own tab —
-# never hand the selection to that.
+# last tab rather than the one they were reading.
 restore_front() {
-  local want="$1" mine="${2:-}" now
+  local want="$1" now
   [[ -n "$want" ]] || return 0
   now=$(front)
   [[ -n "$now" && "$now" != "$want" ]] || return 0
-  [[ -z "$mine" || "$now" != "$mine" ]] || return 0
   # only if the tab is still there to go back to
   curl -fsS --max-time 3 "http://127.0.0.1:$PORT/json" 2>/dev/null \
     | jq -e --arg id "$want" 'any(.[]; .id == $id)' >/dev/null 2>&1 || return 0
@@ -212,14 +210,28 @@ finally:
 PY
 }
 
+# Every verb needs this, but `pick`, `run` and `cleanup` exit inside the case and
+# never reach the generic path below -- and any of them can be the command that
+# restarts the daemon and so gets a spare parked in the human's window. Catch all
+# of them on the way out. The trap restores only when it actually closed a spare:
+# that is unambiguously our doing, so it can never fight a human who switched
+# tabs mid-command. It is idempotent -- when the paths below already cleaned up,
+# there is no spare left to find and the trap does nothing.
+PRE_BLANKS=$(blanks)
+FBEFORE=$(front)
+settle() {
+  local rc=$?
+  reap_spares "$PRE_BLANKS" 0 && restore_front "$FBEFORE"
+  return $rc
+}
+trap 'settle' EXIT
+
 SPAWNING=0
 case "$1" in
   spawn)
     URL="${2:?usage: ab-bg <session> spawn <url>}"
     SPAWNING=1
-    PRE_BLANKS=$(blanks)
     XBEFORE=$(xfocus)
-    FBEFORE=$(front)
 
     TID=""
     if [[ "$OWN_WINDOW" == 1 ]]; then
@@ -239,7 +251,7 @@ case "$1" in
       reap_spares "$PRE_BLANKS" 3
       # Closing it leaves Chrome on the neighbouring tab, so give the user back
       # the tab they were on before touching X focus.
-      restore_front "$FBEFORE" "$TID"
+      restore_front "$FBEFORE"
       # hand the X focus back if anything took it
       XAFTER=$(xfocus)
       if [[ -n "$XBEFORE" && -n "$XAFTER" && "$XBEFORE" != "$XAFTER" ]]; then
@@ -431,10 +443,6 @@ PY
     ;;
 esac
 
-# Any command can be the one that (re)starts the daemon, and the spare it opens
-# lands in the user's window whether or not we are spawning — so always know
-# which blanks predate us.
-PRE_BLANKS="${PRE_BLANKS-$(blanks)}"
 BEFORE=$(front)
 ab --pin-tab "$@"
 STATUS=$?
@@ -452,7 +460,7 @@ if [[ -n "$BEFORE" && -n "$AFTER" && "$AFTER" != "$BEFORE" ]]; then
   MINE=$(ab --pin-tab --json tab list 2>/dev/null \
     | jq -r '.data.tabs[]? | select(.active) | .targetId // empty')
   if [[ "$AFTER" == "$MINE" || "$REAPED" == 1 ]]; then
-    restore_front "$BEFORE" "$MINE"
+    restore_front "$BEFORE"
   fi
 fi
 exit $STATUS
